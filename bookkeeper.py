@@ -108,7 +108,7 @@ LINK_HINT = re.compile(r'invoice|receipt|bill|factuur|download|pdf|statement|pay
 CSV_FIELDS = ['doc_id', 'supplier', 'supplier_vat', 'vies_status', 'doc_type', 'invoice_no', 'invoice_date', 'period', 'currency',
               'net', 'vat', 'gross', 'fx_rate', 'fx_source', 'net_eur', 'vat_eur', 'gross_eur', 'rc_vat_eur', 'rate_pct',
               'treatment', 'reason', 'risk', 'confidence', 'needs_review', 'review_reason', 'duplicate_of', 'bucket',
-              'payment', 'category', 'source', 'source_file', 'page', 'gmail_link']
+              'payment', 'category', 'source', 'source_file', 'page', 'gmail_link', 'direction']
 
 
 # ---------- quarters ----------
@@ -668,7 +668,7 @@ def archive_previous(out: Path, label: str, ledger: dict, period) -> None:
         shutil.move(old, dest)
         logger.info('Moved previous %s output to %s', label, dest)
     lo, hi = (period[0].isoformat(), period[1].isoformat()) if period else ('', '9999-12-31')
-    for k in [k for k, v in ledger.items() if v.get('source') != 'manual' and (v.get('folder') == label or lo <= v.get('date', '') <= hi)]:
+    for k in [k for k, v in ledger.items() if v.get('source') not in ('manual', 'sales') and (v.get('folder') == label or lo <= v.get('date', '') <= hi)]:
         del ledger[k]
 
 
@@ -1038,7 +1038,8 @@ def load_rules(out: Path) -> dict:
     rules['documents'] = {norm_no(k): v for k, v in {**(ans.get('documents') or {}), **(dec.get('documents') or {})}.items()}
     rules['ignored_payments'] = set(ans.get('ignored_payments') or [])
     rules['payment_links'] = ans.get('payment_links') or {}  # payment id -> doc_id, set by the owner in the portal
-    rules['registration_date'] = str(rules.get('registration_date') or '0000-00-00')
+    rules['registration_date'] = str(dec.get('registration_date') or rules.get('registration_date') or '0000-00-00')
+    rules['credit_brought_forward'] = dec.get('credit_brought_forward') or {}
     rules['ignore_payments'] = dec.get('ignore_payments') or []
     rules['vat_number'] = norm_no(dec.get('vat_number') or os.environ.get('BOOKKEEPER_VAT_NUMBER'))
     return rules
@@ -1177,6 +1178,7 @@ def build_row(key: str, rec: dict, rules: dict, vendors: dict, fx) -> dict:
     business = buyer_ok or bool(sup.get('business')) or vend.get('deductible') is True
     by_id = rules['documents'].get(norm_no(key))
     by_no = rules['documents'].get(norm_no(rec.get('invoice_number')))
+    by_id, by_no = (None if d and d.get('treatment') in SALE_TREATMENTS else d for d in (by_id, by_no))
     if by_id and by_id.get('treatment'):
         t, reason = by_id['treatment'], f'owner decision: {by_id.get("note", "")}'
     elif rec.get('duplicate_of'):
@@ -1263,7 +1265,7 @@ def build_row(key: str, rec: dict, rules: dict, vendors: dict, fx) -> dict:
     if accepted:  # the owner has looked at this row: it leaves the review queue
         why, reason = [], f'{reason} (checked by the owner{": " + accepted["note"] if accepted.get("note") else ""})'
     y, m = (day[:4], int(day[5:7])) if valid_date(day) else ('', 1)
-    return {'doc_id': key, 'supplier': rec.get('vendor') or '', 'supplier_vat': rec.get('supplier_vat') or '', 'vies_status': '',
+    return {'doc_id': key, 'direction': 'purchase', 'supplier': rec.get('vendor') or '', 'supplier_vat': rec.get('supplier_vat') or '', 'vies_status': '',
             'doc_type': dt or '', 'invoice_no': rec.get('invoice_number') or '', 'invoice_date': day, 'period': f'{y}-Q{(m - 1) // 3 + 1}' if y else '',
             'currency': cur or '', 'net': net, 'vat': vat, 'gross': gross, 'fx_rate': fx_rate, 'fx_source': fx_source,
             'net_eur': net_eur, 'vat_eur': vat_eur, 'gross_eur': gross_eur,
@@ -1308,7 +1310,16 @@ def return_boxes(rows: list[dict]) -> dict:
     b['17'] = r2(b['8'] - b['16'])
     b['31'], b['37'] = tot('net_eur', *CLAIM), tot('vat_eur', *CLAIM)
     b['31_without_oss'], b['37_without_oss'] = tot('net_eur', 'domestic_input'), tot('vat_eur', 'domestic_input')
-    b['42'] = r2(b['37'] - b['17'])
+    for t, box in SALE_BOX.items():  # sales without output VAT: Boxes 1, 2, 20, 21
+        b[box] = tot('net_eur', t)
+    for rate, (net_box, vat_box) in SALE_RATE_BOX.items():  # taxable sales per rate
+        mine = [r for r in rows if r['treatment'] == 'sale_domestic' and r['rate_pct'] == rate]
+        b[net_box], b[vat_box] = r2(sum(r['net_eur'] or 0 for r in mine)), r2(sum(r['vat_eur'] or 0 for r in mine))
+    b['22'] = r2(sum(b[k] for k in ('18', '18a', '18b', '19', '20', '21')))
+    b['25'] = r2(sum(b[k] for k in ('23', '23a', '23b', '24')))
+    b['26'] = r2(b['17'] + b['25'])
+    net = r2(b['37'] - b['26'])  # input VAT less output VAT, before adjustments and credit brought forward
+    b['42'], b['43'] = max(net, 0.0), max(-net, 0.0)
     return b
 
 
@@ -1322,25 +1333,33 @@ def table_checks(rows: list[dict], label: str = '') -> list[tuple[str, bool, str
     twice = sorted({f'{s} {n}' for s, n in ids if ids.count((s, n)) > 1})
     outside = [r['doc_id'] for r in used if re.fullmatch(r'\d{4}-Q[1-4]', label) and r['period'] != label]
     nofile = [r['doc_id'] for r in used if not r['source_file']]
+    sales = [r for r in rows if is_sale(r) and (r['treatment'] in SALE_BOX or r['treatment'] == 'sale_domestic')]
+    sale_no_eur = [r['doc_id'] for r in sales if r['net_eur'] is None or (r['treatment'] == 'sale_domestic' and r['rate_pct'] not in SALE_RATE_BOX)]
+    sale_nos = [norm_no(r['invoice_no']) for r in sales]
+    sale_twice = sorted({n for n in sale_nos if n and sale_nos.count(n) > 1})
     return [('net + VAT = gross on every row', not bad_sum, ', '.join(bad_sum)),
             ('every claimed row has EUR values', not no_eur, ', '.join(no_eur)),
             ('no document counted twice', not twice, ', '.join(twice)),
             ('every claimed row is dated inside the period', not outside, ', '.join(outside)),
             ('every claimed row has its file', not nofile, ', '.join(nofile)),
             ('Box 4 = Box 11 and Box 7 = Box 15', b['4'] == b['11'] and b['7'] == b['15'], ''),
-            ('Box 17 = 0.00 (reverse charge nets out)', b['17'] == 0, f'{b["17"]:.2f}')]
+            ('Box 17 = 0.00 (reverse charge nets out)', b['17'] == 0, f'{b["17"]:.2f}'),
+            ('every sale in the return has EUR values and a box', not sale_no_eur, ', '.join(sale_no_eur)),
+            ('no sales invoice number is used twice', not sale_twice, ', '.join(sale_twice))]
 
 
 def fmt(x) -> str:
     return '' if x is None else f'{x:,.2f}'
 
 
-def write_worksheet(qdir: Path, rows: list[dict], unpaid: list[dict] | None = None) -> None:
+def write_worksheet(qdir: Path, rows: list[dict], unpaid: list[dict] | None = None, unbilled: list[dict] | None = None) -> None:
     """<label>_VAT_worksheet.md: box values, hard checks, the claimed rows per section, reconciliations and the review queue.
     A working paper for the owner to check. The tool never files or submits anything."""
     label = qdir.name
     b, checks = return_boxes(rows), table_checks(rows, label)
     sec = lambda *ts: [r for r in rows if r['treatment'] in ts]
+    brought, bf_note = brought_forward(qdir.parent, label)
+    f = return_form(rows, brought)
     line = lambda r: (f'| {r["invoice_date"]} | {r["supplier"][:32]} | {r["invoice_no"]} | {r["currency"]} {fmt(r["gross"])} | {fmt(r["net_eur"])} | '
                       f'{fmt(r["rc_vat_eur"] if r["treatment"] in RC else r["vat_eur"])} | {r["fx_source"]} {r["fx_rate"] if r["fx_source"] else ""} | {r["vies_status"]} | {r["risk"]} |')
     head = '| Date | Supplier | Invoice | Gross | Net EUR | VAT EUR | FX | VIES | Risk |\n|---|---|---|---|---|---|---|---|---|'
@@ -1352,7 +1371,14 @@ def write_worksheet(qdir: Path, rows: list[dict], unpaid: list[dict] | None = No
            f'| 5 / 8 and 12 / 16 | Reverse-charge totals | {fmt(b["5"])} / {fmt(b["8"])} |',
            f'| 31 / 37 | Domestic purchases net / input VAT, with the OSS items | {fmt(b["31"])} / {fmt(b["37"])} |',
            f'| 31 / 37 | The same without the OSS items | {fmt(b["31_without_oss"])} / {fmt(b["37_without_oss"])} |',
-           f'| 17 | Box 8 minus Box 16 | {fmt(b["17"])} |', f'| 42 | Excess credit (with the OSS items, no output VAT, nothing brought forward) | {fmt(b["42"])} |', '',
+           f'| 17 | Box 8 minus Box 16 | {fmt(b["17"])} |',
+           f'| 1 | Sales to VAT-registered EU customers, the customer accounts for the VAT | {fmt(b["1"])} |', f'| 2 | Sales with the place of supply outside Malta | {fmt(b["2"])} |',
+           f'| 18 / 23 | Taxable sales at 18%, net / VAT | {fmt(b["18"])} / {fmt(b["23"])} |',
+           f'| 18a / 23a, 18b / 23b, 19 / 24 | Taxable sales at 7%, 12%, 5%, net / VAT | {fmt(b["18a"])} / {fmt(b["23a"])}, {fmt(b["18b"])} / {fmt(b["23b"])}, {fmt(b["19"])} / {fmt(b["24"])} |',
+           f'| 20 / 21 | Exports and exempt with credit / exempt without credit | {fmt(b["20"])} / {fmt(b["21"])} |',
+           f'| 22 / 25 | Sales sub-total / output VAT | {fmt(b["22"])} / {fmt(b["25"])} |', f'| 26 | Box 17 + Box 25 | {fmt(b["26"])} |',
+           f'| 42 / 43 | Excess credit / tax due (with the OSS items, before credit brought forward) | {fmt(f["42"])} / {fmt(f["43"])} |',
+           f'| 44 / 45 | Excess credit brought forward / tax payable | {fmt(f["44"])} / {fmt(f["45"])} |', ''] + ([bf_note, ''] if bf_note else []) + [
            f'Rounding: {rules_std_note(b)}', '', '## Hard checks', '']
     out += [f'- {"PASS" if ok else "**FAIL**"}: {name}{f" ({detail})" if detail and not ok else ""}' for name, ok, detail in checks]
     for title, ts in (('A. Domestic input VAT', ('domestic_input',)), ('B. Reverse-charge services', RC), ('C. Risk items: Maltese VAT charged through OSS', ('oss_risk',))):
@@ -1360,7 +1386,21 @@ def write_worksheet(qdir: Path, rows: list[dict], unpaid: list[dict] | None = No
         vat_field = 'rc_vat_eur' if ts == RC else 'vat_eur'
         out += ['', f'## {title}', '', head] + [line(r) for r in part] + \
                [f'| | **Total ({len(part)} documents)** | | | **{fmt(r2(sum(r["net_eur"] or 0 for r in part)))}** | **{fmt(r2(sum(r[vat_field] or 0 for r in part)))}** | | | |']
-    bolt = [r for r in rows if re.search(r'\bbolt\b', r['supplier'], re.I) and r['treatment'] != 'duplicate']
+    sales = [r for r in rows if is_sale(r)]
+    if sales:
+        box = lambda r: 'Box ' + (SALE_BOX.get(r['treatment']) or ' / '.join(SALE_RATE_BOX.get(r['rate_pct'], ('?',)))) if r['treatment'] in SALE_BOX or r['treatment'] == 'sale_domestic' else r['treatment'].replace('_', ' ')
+        out += ['', f'## D. Sales ({len(sales)} invoices issued)', '', '| Date | Customer | Invoice | Gross | Net EUR | VAT EUR | Reported in | VIES | Payment |', '|---|---|---|---|---|---|---|---|---|']
+        out += [f'| {r["invoice_date"]} | {r["supplier"][:32]} | {r["invoice_no"]} | {r["currency"]} {fmt(r["gross"])} | {fmt(r["net_eur"])} | {fmt(r["vat_eur"])} | {box(r)} | {r["vies_status"]} | {r["payment"]} |' for r in sales]
+        recap, gaps = recap_statement(rows), sales_gaps(rows)
+        if recap:
+            out += ['', '### Recapitulative statement (EU customers behind Box 1)', '', '| Country | VAT number | Customer | Kind | Net EUR |', '|---|---|---|---|---|'] + [f'| {" | ".join(x)} |' for x in recap]
+        if gaps:
+            out += ['', f'**Invoice numbers missing from the series: {", ".join(gaps)}.** Add them to output/sales/, or they belong to another quarter.']
+    if unbilled:
+        out += ['', f'## Money in without a sales invoice ({len(unbilled)})', '', 'Payments received that matched no issued invoice. Add the invoice to output/sales/, or mark it as not a sale in the portal '
+                '(refund, own transfer).', '', '| Date | Account | Amount | Description |', '|---|---|---|---|']
+        out += [f'| {t["date"]} | {t["account"]} | {t["currency"]} {fmt(t["amount"])} | {t["text"][:70]} |' for t in unbilled]
+    bolt = [r for r in rows if re.search(r'\bbolt\b', r['supplier'], re.I) and r['treatment'] != 'duplicate' and not is_sale(r)]
     if bolt:
         with_no = sum(r['_buyer_ok'] for r in bolt)
         out += ['', '## Bolt rides (reconciliation only, none is claimed until the owner marks the business rides)', '',
@@ -1382,11 +1422,11 @@ def write_worksheet(qdir: Path, rows: list[dict], unpaid: list[dict] | None = No
         counts[r['treatment']][0] += 1
         counts[r['treatment']][1] += r['gross_eur'] or 0
     out += ['', '## All documents by treatment', '', '| Treatment | Documents | Gross EUR |', '|---|---|---|'] + [f'| {t} | {n} | {fmt(g)} |' for t, (n, g) in sorted(counts.items())]
-    queue = [r for r in rows if r['needs_review'] and r['treatment'] not in ('duplicate', 'pre_registration', 'not_a_purchase')]
+    queue = [r for r in rows if r['needs_review'] and r['treatment'] not in ('duplicate', 'pre_registration', 'not_a_purchase', 'not_a_sale')]
     out += ['', f'## Review queue ({len(queue)}): the owner decides, the tool does not', '', '| Date | Supplier | Invoice | Gross | Treatment | Why |', '|---|---|---|---|---|---|']
     out += [f'| {r["invoice_date"]} | {r["supplier"][:32]} | {r["invoice_no"]} | {r["currency"]} {fmt(r["gross"])} | {r["treatment"]} | {r["review_reason"]} |'
             for r in sorted(queue, key=lambda r: (r['treatment'] not in CLAIM + RC, r['treatment'], r['invoice_date']))]
-    out += ['', 'Not covered by this tool: bank and card reconciliation, business purpose per taxi ride, mixed-use apportionment. '
+    out += ['', 'Not covered by this tool: goods for re-sale, capital goods, purchases at reduced rates, adjustments, business purpose per taxi ride, mixed-use apportionment. '
             'Tax-impact questions go to the accountant first.', '']
     (qdir / f'{label}_VAT_worksheet.md').write_text('\n'.join(out))
 
@@ -1396,7 +1436,7 @@ def rules_std_note(b: dict) -> str:
             'a gap of a cent or two is expected, a larger one means a row is not at 18% or is misread.')
 
 
-def write_summary(qdir: Path, rows: list[dict], unpaid: list[dict] | None = None, statements: list[dict] | None = None) -> None:
+def write_summary(qdir: Path, rows: list[dict], unpaid: list[dict] | None = None, statements: list[dict] | None = None, unbilled: list[dict] | None = None) -> None:
     """summary.csv (the whole table), summary_by_vendor.csv (EUR, per supplier and treatment) and the worksheet."""
     with open(qdir / 'summary.csv', 'w', newline='') as f:
         w = csv.DictWriter(f, CSV_FIELDS, extrasaction='ignore')
@@ -1413,13 +1453,22 @@ def write_summary(qdir: Path, rows: list[dict], unpaid: list[dict] | None = None
         w.writerow(['supplier', 'treatment', 'documents', 'net_eur', 'vat_eur', 'gross_eur'])
         for (supplier, treatment), (n, net, vat, gross) in sorted(totals.items()):
             w.writerow([supplier, treatment, n, f'{net:.2f}', f'{vat:.2f}', f'{gross:.2f}'])
-    write_worksheet(qdir, rows, unpaid)
+    write_worksheet(qdir, rows, unpaid, unbilled)
+    recap, rpath = recap_statement(rows), qdir / f'{qdir.name}_recapitulative_statement.csv'
+    if recap:
+        with open(rpath, 'w', newline='') as f:
+            csv.writer(f).writerows([['country', 'customer_vat', 'customer', 'kind', 'net_eur']] + recap)
+    else:
+        rpath.unlink(missing_ok=True)
     (qdir / '.review.json').write_text(json.dumps({'rows': [{k: v for k, v in r.items() if not k.startswith('_')} for r in rows],
-                                                   'unpaid': [{**t, 'id': payment_id(t)} for t in unpaid or []], 'statements': statements}))
+                                                   'unpaid': [{**t, 'id': payment_id(t)} for t in unpaid or []], 'unbilled': [{**t, 'id': payment_id(t)} for t in unbilled or []],
+                                                   'statements': statements}))
     b = return_boxes(rows)
     logger.info('%d documents (%d need review) -> %s', len(rows), sum(r['needs_review'] for r in rows), qdir)
     logger.info('Domestic input: net %.2f, VAT %.2f (without OSS items: %.2f / %.2f). Reverse charge: net %.2f, VAT %.2f',
                 b['31'], b['37'], b['31_without_oss'], b['37_without_oss'], b['5'], b['8'])
+    if any(is_sale(r) for r in rows):
+        logger.info('Sales: Box 1 %.2f, Box 2 %.2f, taxable net %.2f, output VAT %.2f. Excess credit %.2f, tax due %.2f', b['1'], b['2'], b['22'], b['25'], b['42'], b['43'])
     for name, ok, detail in table_checks(rows, qdir.name):
         if not ok:
             logger.warning('CHECK FAILED: %s %s', name, detail)
@@ -1513,19 +1562,19 @@ def match_payments(rows: list[dict], txs: list[dict], rules: dict | None = None)
         r = by_id.get(links.get(payment_id(t)))
         if r is not None and not t['used'] and not r['payment']:
             t['used'] = True
-            r['payment'] = f'{t["date"]} {t["account"]} {t["currency"]} {-t["amount"]:.2f} (linked by you)'
+            r['payment'] = f'{t["date"]} {t["account"]} {t["currency"]} {abs(t["amount"]):.2f} (linked by you)'
     for r in order:
         if r['payment']:
             continue
         words = [w for w in re.findall(r'[a-z]{4,}', r['supplier'].lower()) if w not in ('limited', 'malta', 'noreply', 'billing', 'online', 'services', 'receipts')][:3]
         best = None
         for t in txs:
-            if t['used'] or t['amount'] >= 0:
+            if t['used'] or (t['amount'] > 0) != is_sale(r):  # a purchase is paid with money out, a sale with money in
                 continue
             gap = days(t['date'], r['invoice_date'])
-            if not -PAY_BEFORE <= gap <= PAY_AFTER:
+            if not -PAY_BEFORE <= gap <= (SALE_PAY_AFTER if is_sale(r) else PAY_AFTER):
                 continue
-            paid = -t['amount']
+            paid = abs(t['amount'])
             exact = t['currency'] == r['currency'] and abs(paid - r['gross']) <= 0.011
             near = t['currency'] != r['currency'] and t['currency'] == 'EUR' and r['gross_eur'] and abs(paid - r['gross_eur']) <= FX_TOLERANCE * r['gross_eur']
             if not (exact or near):
@@ -1537,9 +1586,9 @@ def match_payments(rows: list[dict], txs: list[dict], rules: dict | None = None)
         if best:
             _, t, exact, named = best
             t['used'] = True
-            r['payment'] = f'{t["date"]} {t["account"]} {t["currency"]} {-t["amount"]:.2f}' + ('' if exact else ' (other currency)') + ('' if named else ' (amount only)')
+            r['payment'] = f'{t["date"]} {t["account"]} {t["currency"]} {abs(t["amount"]):.2f}' + ('' if exact else ' (other currency)') + ('' if named else ' (amount only)')
         elif hi >= r['invoice_date'] and days(lo, r['invoice_date']) <= PAY_AFTER:  # the statements reach into its payment window
-            r['payment'] = 'no payment found'
+            r['payment'] = 'no payment found' + (' (not paid yet?)' if is_sale(r) else '')
             if r['treatment'] in CLAIM + RC and not r.get('_accepted'):
                 r['review_reason'] = '; '.join(filter(None, [r['review_reason'], 'no payment found in the statements: cash or another card?']))
                 r['needs_review'] = True
@@ -1562,6 +1611,261 @@ def statement_stats(folder: Path, txs: list[dict], unpaid: list[dict]) -> list[d
         stats.append({'file': path.name, 'transactions': len(mine), 'from': min((t['date'] for t in mine), default=''), 'to': max((t['date'] for t in mine), default=''),
                       'matched': sum(t['used'] for t in mine), 'unmatched': sum(t['account'] == path.stem for t in unpaid)})
     return stats
+
+
+# ---------- sales: the invoices the owner issued (output/sales/: a CSV list, PDFs or photos) ----------
+
+# Malta VAT FORM 003/2011: where a sale is reported. Net box, VAT box (None = no output VAT).
+SALE_BOX = {'sale_eu_reverse_charge': '1', 'sale_outside_malta': '2', 'sale_export': '20', 'sale_exempt': '21'}
+SALE_RATE_BOX = {18: ('18', '23'), 7: ('18a', '23a'), 12: ('18b', '23b'), 5: ('19', '24')}
+SALE_TREATMENTS = ('sale_domestic', 'sale_eu_reverse_charge', 'sale_outside_malta', 'sale_export', 'sale_exempt', 'not_a_sale')
+SALE_PAY_AFTER = 90  # a customer may pay this many days after the invoice date
+SALE_COLS = {'invoice_number': ('invoice number', 'invoice no', 'invoice no.', 'invoice #', 'invoice', 'number', 'no', 'invoice_no', 'invoice_number'),
+             'date': ('invoice date', 'date', 'issue date', 'issued', 'invoice_date'),
+             'vendor': ('customer', 'client', 'customer name', 'client name', 'name', 'bill to'),
+             'customer_country': ('country', 'customer country', 'client country', 'customer_country'),
+             'customer_vat': ('customer vat', 'customer vat number', 'vat number', 'vat no', 'vat no.', 'vat id', 'customer_vat'),
+             'net_amount': ('net', 'net amount', 'subtotal', 'amount excl vat', 'amount excl. vat', 'amount'),
+             'vat_amount': ('vat', 'vat amount', 'tax', 'tax amount'), 'total_amount': ('gross', 'total', 'total amount', 'amount incl vat', 'amount incl. vat'),
+             'vat_rate': ('vat rate', 'rate', 'vat %', 'vat_rate'), 'currency': ('currency',), 'supply': ('supply', 'type', 'kind'),
+             'treatment': ('treatment',)}
+SALES_PROMPT = """You read one sales invoice or credit note that a sole trader (the seller) issued to a customer.
+Report only what the document shows. Reply with ONLY a JSON object:
+{"is_invoice": bool, "customer": str, "customer_country": "ISO-2 or null", "customer_vat": str|null,
+ "date": "YYYY-MM-DD or null", "invoice_number": str|null, "currency": "ISO code or null",
+ "total_amount": number|null, "net_amount": number|null, "vat_amount": number|null, "vat_rate": number|null,
+ "reverse_charge": bool, "supply": "services|goods|mixed|null", "confidence": 0..1}
+- customer: the party billed (bill-to block), never the seller. customer_vat: the customer's VAT number as printed.
+- total_amount = gross including VAT, net_amount = excluding VAT, vat_amount = VAT charged (0 if none). A credit note has negative amounts.
+- is_invoice: false for quotations, pro-forma invoices, statements and anything that is not an issued invoice or credit note.
+
+--- Document text ---
+"""
+is_sale = lambda r: r.get('direction') == 'sale'
+
+
+def read_sales_csv(path: Path) -> list[dict]:
+    """The owner's own list of issued invoices (an export of the invoicing tool, or typed by hand): one record per row.
+    Columns are found by header name (SALE_COLS). [] if the file is not such a list."""
+    try:
+        lines = path.read_text(encoding='utf-8-sig', errors='replace').splitlines()
+        start = next(i for i, l in enumerate(lines[:20]) if 'date' in l.lower() and re.search(r'invoice|number|customer|client', l, re.I))
+        rd = csv.DictReader(lines[start:], dialect=csv.Sniffer().sniff(lines[start], delimiters=',;\t'))
+        cols = {str(c).strip().lower(): c for c in rd.fieldnames or [] if c}
+    except (OSError, StopIteration, csv.Error):
+        return []
+    pick = {k: next((cols[n] for n in names if n in cols), None) for k, names in SALE_COLS.items()}
+    if not pick['date'] or not pick['invoice_number'] or not (pick['net_amount'] or pick['total_amount']):
+        return []
+    recs = []
+    for row in rd:
+        get = lambda k: str(row.get(pick[k]) or '').strip() if pick[k] else ''
+        day = parse_date(get('date'))
+        amount = lambda k: bank_amount(get(k).rstrip('%'))
+        if not day or not get('invoice_number') or (amount('net_amount') is None and amount('total_amount') is None):
+            continue
+        recs.append({'vendor': get('vendor'), 'date': day.isoformat(), 'invoice_number': get('invoice_number'), 'currency': get('currency').upper() or 'EUR',
+                     'total_amount': amount('total_amount'), 'net_amount': amount('net_amount'), 'vat_amount': amount('vat_amount'), 'vat_rate': amount('vat_rate'),
+                     'customer_country': get('customer_country').upper()[:2], 'customer_vat': get('customer_vat'), 'supply': get('supply').lower() or 'services',
+                     'treatment_hint': get('treatment').lower(), 'confidence': 1.0, 'files': [], 'source': 'sales_csv'})
+    return recs
+
+
+def read_sale_file(path: Path, client) -> dict | None:
+    """One issued invoice as a PDF or photo: regex pass, then the AI when it is configured (the customer is only read by the AI)."""
+    ext, data = manual_bytes(path)
+    text = pdf_text(data) if ext == '.pdf' else ''
+    found = parse_fields(text)
+    rec = {'vendor': '', 'date': find_invoice_date(text), 'invoice_number': found.get('invoice_number'), 'currency': found.get('currency'),
+           'total_amount': found.get('total_amount'), 'vat_amount': found.get('vat_amount'), 'confidence': 0.4}
+    if client:
+        try:
+            binary = unreadable_file([(path.name, ext, data)], text)
+            content = [{'type': 'text', 'text': SALES_PROMPT + (text[:8000] or '(attached file)')}]
+            if binary:
+                content.insert(0, {'type': MEDIA[ext][0], 'source': {'type': 'base64', 'media_type': MEDIA[ext][1], 'data': base64.b64encode(data).decode()}})
+            got = ask_json(client, '', 600, content)
+            if not got.get('is_invoice', True):
+                return None
+            rec = {**got, 'vendor': got.get('customer') or '', 'ai': True}
+        except Exception as e:
+            logger.warning('The AI could not read sales file %s, using regex: %s', path, e)
+    rec.update(source='sales', files=[], date=valid_date(rec.get('date')) or datetime.fromtimestamp(path.stat().st_mtime).date().isoformat())
+    return rec
+
+
+def sale_row(key: str, rec: dict, rules: dict, fx) -> dict:
+    """One table row for an issued invoice: checked amounts, EUR values and the box it is reported in (first matching rule).
+    As with purchases, nothing here is a tax decision: anything unclear goes to needs_review."""
+    why = []
+    home, std = rules.get('home_country', 'MT'), rules.get('standard_rate', 18)
+    gross, net, vat, rate = (num(rec.get(k)) for k in ('total_amount', 'net_amount', 'vat_amount', 'vat_rate'))
+    cur, day = str(rec.get('currency') or '').upper() or None, rec.get('date') or ''
+    if gross is None and net is not None:
+        vat = vat if vat is not None else r2(net * rate / 100) if rate else 0.0
+        gross = r2(net + vat)
+    if gross is not None:
+        if vat is None:
+            vat = r2(gross - net) if net is not None else r2(gross * rate / (100 + rate)) if rate else None
+        if net is None and vat is not None:
+            net = r2(gross - vat)
+        if None not in (net, vat) and abs(net + vat - gross) > 0.02:
+            why.append(f'net {net:.2f} + VAT {vat:.2f} != gross {gross:.2f}')
+    if rate is None and net and vat:
+        rate = next((k for k in (rules.get('vat_rates') or {}).get(home) or [std] if abs(vat / net * 100 - k) < 0.3), None)
+    has_vat = bool(vat)
+    if has_vat and rate and net and abs(net * rate / 100 - vat) > 0.03:
+        why.append(f'VAT {vat:.2f} is not {rate:g}% of the net {net:.2f}')
+    fx_rate = fx_source = net_eur = vat_eur = gross_eur = None
+    if gross is not None and cur == 'EUR':
+        fx_rate, fx_source, net_eur, vat_eur, gross_eur = 1.0, '', net, vat, gross
+    elif gross is not None and cur:
+        ecb, ecb_day = fx.rate(cur, day)
+        if ecb:
+            fx_rate, fx_source = ecb, f'ECB {ecb_day}'
+            net_eur, vat_eur, gross_eur = (r2(x / ecb) if x is not None else None for x in (net, vat, gross))
+        else:
+            fx_source = f'no ECB rate for {cur}'
+
+    cc = str(rec.get('customer_country') or '').upper()[:2] or None
+    cvat = re.sub(r'[^A-Za-z0-9]', '', str(rec.get('customer_vat') or '')).upper()
+    if not cc and re.match(r'[A-Z]{2}\d', cvat):
+        cc = {'EL': 'GR'}.get(cvat[:2], cvat[:2])
+    goods = rec.get('supply') == 'goods'
+    by = next((d for d in (rules['documents'].get(norm_no(key)), rules['documents'].get(norm_no(rec.get('invoice_number')))) if d), None)
+    hint = rec.get('treatment_hint') if rec.get('treatment_hint') in SALE_TREATMENTS else None
+    if by and by.get('treatment') in SALE_TREATMENTS:
+        t, reason = by['treatment'], f'owner decision: {by.get("note", "")}'
+    elif gross is None:
+        t, reason = 'needs_review', 'no amount could be read'
+    elif gross == 0:
+        t, reason = 'not_a_sale', 'zero amount'
+    elif day < rules['registration_date']:
+        t, reason = 'pre_registration', 'dated before the VAT registration'
+    elif hint:
+        t, reason = hint, 'treatment given in the sales list'
+    elif has_vat:
+        t, reason = ('sale_domestic', f'{rate:g}% VAT charged') if rate in SALE_RATE_BOX else ('needs_review', f'VAT charged at {rate or "an unknown"}%, not a rate of the return form')
+    elif not cc:
+        t, reason = 'needs_review', 'no VAT charged and the customer country is unknown'
+    elif cc == home:
+        t, reason = 'needs_review', 'no VAT charged to a Maltese customer: exempt supply (Box 21), or is the VAT missing?'
+    elif cc in EU and cvat:
+        t, reason = 'sale_eu_reverse_charge', f'{"goods" if goods else "services"} to a VAT-registered {cc} customer without VAT: the customer accounts for it'
+    elif cc in EU:
+        t, reason = 'needs_review', f'no VAT charged to a customer in {cc} without a VAT number: Maltese VAT (or OSS) normally applies to consumers'
+    else:
+        t, reason = ('sale_export', f'goods to {cc}, outside the EU') if goods else ('sale_outside_malta', f'services to a {cc} customer, outside the EU')
+    if t == 'needs_review':
+        why.insert(0, reason)
+    if t in SALE_BOX or t == 'sale_domestic':
+        if t == 'sale_domestic' and rate not in SALE_RATE_BOX:
+            why.append('taxable sale without a VAT rate of the form: it is in no box until the VAT is on the invoice')
+        if net_eur is None:
+            why.append('no EUR value')
+        if not rec.get('vendor'):
+            why.append('customer name not read')
+        if t == 'sale_eu_reverse_charge' and not cvat:
+            why.append('customer VAT number missing: needed for the recapitulative statement')
+    if (num(rec.get('confidence')) or 0) < rules.get('min_confidence', MIN_CONFIDENCE) and t != 'pre_registration':
+        why.append(f'confidence {rec.get("confidence")}')
+    accepted = bool(by and by.get('accepted'))
+    if accepted:
+        why, reason = [], f'{reason} (checked by the owner{": " + by["note"] if by.get("note") else ""})'
+    y, m = (day[:4], int(day[5:7])) if valid_date(day) else ('', 1)
+    return {'doc_id': key, 'direction': 'sale', 'supplier': rec.get('vendor') or '', 'supplier_vat': cvat, 'vies_status': '', 'doc_type': 'sales_invoice',
+            'invoice_no': rec.get('invoice_number') or '', 'invoice_date': day, 'period': f'{y}-Q{(m - 1) // 3 + 1}' if y else '', 'currency': cur or '',
+            'net': net, 'vat': vat, 'gross': gross, 'fx_rate': fx_rate, 'fx_source': fx_source, 'net_eur': net_eur, 'vat_eur': vat_eur, 'gross_eur': gross_eur,
+            'rc_vat_eur': None, 'rate_pct': rate, 'treatment': t, 'reason': reason, 'risk': '', 'confidence': rec.get('confidence'),
+            'needs_review': bool(why), 'review_reason': '; '.join(dict.fromkeys(why)), 'duplicate_of': '', 'bucket': 'sales', 'category': '',
+            'source': rec.get('source') or 'sales', 'source_file': ' | '.join(rec.get('files') or []), 'page': '', 'gmail_link': '', 'payment': '',
+            '_rec': rec, '_country': cc, '_buyer_ok': False, '_accepted': accepted, '_goods': goods}
+
+
+def build_sales(ledger: dict, out: Path, qdir: Path, period, client, rules: dict) -> list[dict]:
+    """Rows for every issued invoice under output/sales/ dated in the period. A CSV list gives exact figures; a PDF or photo
+    is read once (ledger key sale:<path>) and copied to <quarter>/sales/. The same invoice number in both: the list's
+    figures, the file attached. Customer VAT numbers behind Box 1 are checked in VIES."""
+    folder = out / 'sales'
+    if not folder.is_dir():
+        return []
+    recs, by_no = {}, {}
+    for path in sorted(folder.rglob('*.csv')):
+        got = read_sales_csv(path)
+        logger.info('Sales list %s: %d invoices', path.name, len(got)) if got else logger.warning('Not a readable sales list: %s', path)
+        for rec in got:
+            key = f'sale:{path.relative_to(folder)}#{rec["invoice_number"]}'
+            if norm_no(rec['invoice_number']) in by_no:
+                logger.warning('Sales invoice %s is listed twice, second one ignored (%s)', rec['invoice_number'], path.name)
+                continue
+            recs[key] = by_no[norm_no(rec['invoice_number'])] = rec
+    for path in sorted(folder.rglob('*')):
+        if not path.is_file() or path.suffix.lower() not in MANUAL_EXT or path.name.startswith('.'):
+            continue
+        key = f'sale:{path.relative_to(folder)}'
+        rec = ledger.get(key)
+        if rec is None:
+            try:
+                rec = read_sale_file(path, client)
+            except Exception as e:
+                logger.warning('Sales file could not be read, skipped: %s (%s)', path, e)
+                continue
+            if rec is None:
+                logger.info('Sales file is not an issued invoice, skipped: %s', path)
+                continue
+            ledger[key] = rec
+        listed = by_no.get(norm_no(rec.get('invoice_number'))) if rec.get('invoice_number') else None
+        target = listed or rec
+        if period and not period[0].isoformat() <= target['date'] <= period[1].isoformat():
+            continue
+        ext, data = manual_bytes(path)
+        dest = qdir / 'sales' / (slug(path.stem, 80) + ext)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+        target['files'] = sorted(set((target.get('files') or []) + [str(dest.relative_to(qdir))]))
+        if not listed:
+            recs[key] = rec
+    fx, vpath = FxRates(out), out / '_cache' / 'vies.json'
+    cache = json.loads(vpath.read_text()) if vpath.exists() else {}
+    rows = [sale_row(k, r, rules, fx) for k, r in recs.items() if not period or period[0].isoformat() <= r['date'] <= period[1].isoformat()]
+    for row in rows:
+        if row['treatment'] == 'sale_eu_reverse_charge' and row['supplier_vat']:
+            row['vies_status'] = vies_check(row['supplier_vat'], row['_country'], cache)
+            if not row['vies_status'].startswith('valid') and not row['_accepted']:
+                row['review_reason'] = '; '.join(filter(None, [row['review_reason'], f'customer VAT number: {row["vies_status"]}']))
+                row['needs_review'] = True
+    if cache:
+        vpath.parent.mkdir(parents=True, exist_ok=True)
+        vpath.write_text(json.dumps(cache, indent=1))
+    if rows:
+        logger.info('Sales: %d invoices, net EUR %.2f, output VAT %.2f', len(rows), sum(r['net_eur'] or 0 for r in rows), sum(r['vat_eur'] or 0 for r in rows if r['treatment'] == 'sale_domestic'))
+    return sorted(rows, key=lambda r: (r['invoice_date'], r['invoice_no']))
+
+
+def sales_gaps(rows: list[dict]) -> list[str]:
+    """Invoice numbers missing from the quarter's sales when they run in one numbered series (INV-0007, INV-0009: 0008 is missing)."""
+    parts = [re.fullmatch(r'(.*?)(\d+)', str(r['invoice_no'])) for r in rows if is_sale(r)]
+    if len(parts) < 2 or not all(parts) or len({(m[1], len(m[2])) for m in parts}) != 1:
+        return []
+    nums = sorted(int(m[2]) for m in parts)
+    width, prefix = len(parts[0][2]), parts[0][1]
+    return [f'{prefix}{n:0{width}d}' for n in range(nums[0], nums[-1]) if n not in nums][:20]
+
+
+def recap_statement(rows: list[dict]) -> list[list]:
+    """Recapitulative statement lines: one per VAT-registered EU customer behind Box 1 (net EUR, goods or services)."""
+    tot = defaultdict(float)
+    for r in rows:
+        if r['treatment'] == 'sale_eu_reverse_charge':
+            tot[(r['_country'] if '_country' in r else r['supplier_vat'][:2], r['supplier_vat'], r['supplier'], 'goods' if r.get('_goods') else 'services')] += r['net_eur'] or 0
+    return [[c, v, name, kind, f'{r2(x):.2f}'] for (c, v, name, kind), x in sorted(tot.items(), key=lambda kv: [str(x) for x in kv[0]])]
+
+
+def unmatched_income(txs: list[dict], rules: dict | None = None) -> list[dict]:
+    """Money in that matched no issued invoice (call after match_payments). Refunds and own transfers are answered in the portal."""
+    ignore = [re.compile(x, re.I) for x in (rules or {}).get('ignore_payments') or []]
+    done = (rules or {}).get('ignored_payments') or set()
+    return sorted((t for t in txs if not t['used'] and t['amount'] > 0 and not any(x.search(t['text']) for x in ignore) and payment_id(t) not in done), key=lambda t: -t['amount'])
 
 
 # ---------- manual documents (output/expenses/: invoices that never arrive by email) ----------
@@ -1757,12 +2061,13 @@ def build_packet(qdir: Path, name: str, title: str, sections: list[tuple[str, li
 def build_packets(qdir: Path, rows: list[dict]) -> None:
     """<Q>_claimable.pdf: A domestic input VAT, B reverse-charge services, C risk items (OSS). <Q>_noVAT.pdf: everything
     else except duplicates. Both come from the same table rows as summary.csv, never from a separate filter."""
-    sec = lambda *ts: [r for r in rows if r['treatment'] in ts]
+    sec = lambda *ts: [r for r in rows if r['treatment'] in ts and not is_sale(r)]
     build_packet(qdir, f'{qdir.name}_claimable', f'{qdir.name}: documents behind the VAT return',
                  [('A. Domestic input VAT (Boxes 31 / 37)', sec('domestic_input')), ('B. Reverse-charge services (Boxes 3 to 16)', sec(*RC)),
                   ('C. Risk items: Maltese VAT charged through OSS (inside Boxes 31 / 37 only if the owner keeps them)', sec('oss_risk'))])
     build_packet(qdir, f'{qdir.name}_noVAT', f'{qdir.name}: not claimed (by treatment)',
-                 [(t.replace('_', ' '), sec(t)) for t in sorted({r['treatment'] for r in rows} - set(CLAIM) - set(RC) - {'duplicate'})])
+                 [(t.replace('_', ' '), sec(t)) for t in sorted({r['treatment'] for r in rows if not is_sale(r)} - set(CLAIM) - set(RC) - {'duplicate'})])
+    build_packet(qdir, f'{qdir.name}_sales', f'{qdir.name}: sales invoices issued', [('Sales invoices with a file', [r for r in rows if is_sale(r) and r['source_file']])])
 
 
 def restore_manual(rows: list[dict], qdir: Path, expenses: Path) -> None:
@@ -1790,16 +2095,19 @@ def finalize(records: list[dict], ledger: dict, ledger_path: Path, out: Path, qd
     if period:  # the facts read may put an invoice date outside the email's quarter
         rows = [r for r in rows if period[0].isoformat() <= r['invoice_date'] <= period[1].isoformat()]
     restore_manual(rows, qdir, expenses)
+    rules = load_rules(out)
+    rows += build_sales(ledger, out, qdir, period, client, rules)
     ledger_path.write_text(json.dumps(ledger, indent=2))
     all_txs = txs = read_statements(out / 'statements')
     if period:  # payments of the quarter, plus the window in which its invoices can be paid
-        lo, hi = (period[0] - timedelta(days=PAY_BEFORE)).isoformat(), (period[1] + timedelta(days=PAY_AFTER)).isoformat()
+        lo, hi = (period[0] - timedelta(days=PAY_BEFORE)).isoformat(), (period[1] + timedelta(days=max(PAY_AFTER, SALE_PAY_AFTER))).isoformat()
         txs = [t for t in txs if lo <= t['date'] <= hi]
-    unpaid = match_payments(rows, txs, load_rules(out))
+    unpaid = match_payments(rows, txs, rules)
+    unbilled = unmatched_income(txs, rules)
     if period:
-        unpaid = [t for t in unpaid if period[0].isoformat() <= t['date'] <= period[1].isoformat()]
+        unpaid, unbilled = ([t for t in ts if period[0].isoformat() <= t['date'] <= period[1].isoformat()] for ts in (unpaid, unbilled))
     build_packets(qdir, rows)  # sets the page of each row
-    write_summary(qdir, rows, unpaid, statement_stats(out / 'statements', all_txs, unpaid))
+    write_summary(qdir, rows, unpaid, statement_stats(out / 'statements', all_txs, unpaid + unbilled), unbilled)
 
 
 def run_final(out: Path, label: str, client, expenses: Path) -> None:
@@ -1845,21 +2153,43 @@ FORM = [('Intra-Community and non-EU trade', [
             ('Services and overheads @ 5%', ['32', '38']), ('Sub-total, and Box 39 = input tax', ['33', '39']),
             ('Adjustments: in favour of the department / in your favour', ['40', '41'])]),
         ('Result', [('Excess credit', ['42']), ('Tax due before credit brought forward', ['43']), ('Excess credit brought forward', ['44']), ('Tax payable', ['45'])])]
-FORM_NOT_HANDLED = ('1', '2', '9', '10', '13', '14', '18', '18a', '18b', '19', '20', '21', '22', '23', '23a', '23b', '24', '25', '27', '28', '29', '30',
-                    '31a', '31b', '32', '34', '35', '36', '37a', '37b', '38', '40', '41', '44')
+FORM_NOT_HANDLED = ('9', '10', '13', '14', '27', '28', '29', '30', '31a', '31b', '32', '34', '35', '36', '37a', '37b', '38', '40', '41')
 
 
-def return_form(rows: list[dict]) -> dict:
-    """Every box of VAT FORM 003/2011. Only purchases are handled: reverse-charge services and services / overheads at 18%.
-    Sales, goods for re-sale, capital goods, other rates, adjustments and credit brought forward stay 0.00 (FORM_NOT_HANDLED)."""
+def return_form(rows: list[dict], brought: float = 0.0) -> dict:
+    """Every box of VAT FORM 003/2011. Handled: sales (Boxes 1, 2, 18 to 26), reverse-charge services, services / overheads
+    at 18% and the credit brought forward. Goods for re-sale, capital goods, purchases at other rates and adjustments stay
+    0.00 (FORM_NOT_HANDLED)."""
     b = return_boxes(rows)
     f = {box: 0.0 for _, lines in FORM for _, boxes in lines for box in boxes}
-    f.update({k: b[k] for k in ('3', '4', '5', '6', '7', '8', '9a', '11', '12', '13a', '15', '16', '17', '31', '37')})
-    f['33'], f['39'], f['26'] = f['31'], f['37'], r2(f['17'] + f['25'])
+    f.update({k: v for k, v in b.items() if k in f})
+    f['33'], f['39'] = f['31'], f['37']
     net = r2((f['39'] - f['26']) + (f['41'] - f['40']))
-    f['42'], f['43'] = max(net, 0.0), max(-net, 0.0)
-    f['45'] = r2(f['43'] - f['44'])
+    f['42'], f['43'], f['44'] = max(net, 0.0), max(-net, 0.0), r2(brought)
+    f['45'] = max(r2(f['43'] - f['44']), 0.0)
     return f
+
+
+def brought_forward(out: Path, label: str) -> tuple[float, str]:
+    """Box 44 for a quarter and where it comes from: credit_brought_forward in output/decisions.yml, else Box 42 of the
+    return filed for the quarter before (output/filed.json)."""
+    import yaml
+    dpath, fpath = out / 'decisions.yml', out / 'filed.json'
+    own = ((yaml.safe_load(dpath.read_text()) or {}).get('credit_brought_forward') or {}) if dpath.exists() else {}
+    if label in own:
+        return float(own[label] or 0), 'Box 44 is credit_brought_forward in output/decisions.yml.'
+    if not re.fullmatch(r'\d{4}-Q[1-4]', label):
+        return 0.0, ''
+    m = int(label[:4]) * 4 + int(label[-1]) - 2
+    prev = f'{m // 4}-Q{m % 4 + 1}'
+    try:
+        credit = float((json.loads(fpath.read_text()).get(prev) or {}).get('42') or 0)
+    except (OSError, ValueError):
+        credit = 0.0
+    if not credit:
+        return 0.0, ''
+    return credit, (f'Box 44 is Box 42 of the return filed for {prev} ({credit:.2f}). If that credit was refunded or differs, set '
+                    f'credit_brought_forward: {{{label}: <amount>}} in output/decisions.yml. Check how the portal form carries a remaining credit.')
 
 
 PORTAL_PAGE = """<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Bookkeeper</title>
@@ -1920,17 +2250,17 @@ ul.act{font-size:13px;max-height:260px;overflow:auto}ul.act li{padding:5px 0;bor
 <div id=app><aside><div class=brand><span class=logo>B</span>Bookkeeper</div><label class=ql>Quarter<select id=q></select></label><nav id=nav></nav><div id=job></div>
 <div class=foot>Runs on this computer only. It never files or submits anything.</div></aside><main id=main></main></div><input type=file id=up_p hidden accept=".pdf,.png,.jpg,.jpeg,.heic,.heif">
 <script>
-const TOKEN = "__TOKEN__", CH = __CHOICES__, FORM = __FORM__, NOT = __NOT__, NL = String.fromCharCode(10);
+const TOKEN = "__TOKEN__", CH = __CHOICES__, CHS = __SCHOICES__, FORM = __FORM__, NOT = __NOT__, NL = String.fromCharCode(10);
 const D0 = () => ({sort: 'invoice_date', dir: 1, q: '', tag: '', tr: '', id: '', f_invoice_date: '', f_supplier: '', f_doc_type: '', f_gross_eur: '', f_net_eur: '', f_vat: '', f_treatment: '', f_tags: '', f_payment: ''});
 const R0 = () => ({sort: 'gross_eur', dir: -1, q: '', flag: '', grp: 'open', by: 'supplier', f_invoice_date: '', f_supplier: '', f_gross_eur: '', f_vat: '', f_treatment: '', f_flags: ''});
 const V = {doc: D0(), rev: R0(), pay: {sort: 'amount', dir: -1}};
-let S = null, tab = 'overview', E = {}, P = {}, NOTE = [], sel = new Set(), psel = new Set(), shown = [], pshown = [], payFor = '', G = {}, vis = [], pvis = [], last = '', plast = '';
+let S = null, tab = 'overview', E = {}, P = {}, NOTE = [], sel = new Set(), psel = new Set(), shown = [], pshown = [], payFor = '', payKind = 'receipts', PIDS = {out: [], in: []}, G = {}, vis = [], pvis = [], last = '', plast = '';
 const openG = new Set();
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const money = x => x === null || x === '' || x === undefined ? '' : Number(x).toLocaleString('en', {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const nice = s => String(s || '').replace(/_/g, ' ');
 const claimed = t => ['domestic_input','oss_risk','reverse_charge_eu','reverse_charge_non_eu'].includes(t);
-const live = r => !['duplicate','pre_registration','not_a_purchase'].includes(r.treatment), isOpen = r => r.needs_review && live(r);
+const live = r => !['duplicate','pre_registration','not_a_purchase','not_a_sale'].includes(r.treatment), isSale = r => r.direction === 'sale', isOpen = r => r.needs_review && live(r);
 const paid = r => /^[0-9]{4}/.test(r.payment || ''), vatOf = r => claimed(r.treatment) ? (r.rc_vat_eur ?? r.vat_eur) : r.vat_eur;
 const q = () => document.getElementById('q').value;
 const qname = l => { const [y, n] = l.split('-Q'); return `Q${n} ${y}`; };
@@ -1970,7 +2300,7 @@ function draw(){
   const a = document.activeElement, keep = a && a.id && a.tagName === 'INPUT' && a.type === 'text' ? [a.id, a.selectionStart] : null;
   const ic = d => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${d}</svg>`;
   const tabs = [['overview', 'Overview', '', ic('<path d="M3 11l9-8 9 8"/><path d="M5 10v10h14V10"/>')],
-    ['review', 'Review', S.rows.filter(isOpen).length + S.unpaid.length, ic('<path d="M9 11l3 3 8-8"/><path d="M20 12v7a1 1 0 01-1 1H5a1 1 0 01-1-1V5a1 1 0 011-1h10"/>')],
+    ['review', 'Review', S.rows.filter(isOpen).length + S.unpaid.length + S.unbilled.length, ic('<path d="M9 11l3 3 8-8"/><path d="M20 12v7a1 1 0 01-1 1H5a1 1 0 01-1-1V5a1 1 0 011-1h10"/>')],
     ['documents', 'Documents', S.rows.length, ic('<path d="M14 3H7a1 1 0 00-1 1v16a1 1 0 001 1h10a1 1 0 001-1V7z"/><path d="M14 3v4h4M9 13h6M9 17h6"/>')],
     ['return', 'VAT return', '', ic('<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 7h8M8 12h2M14 12h2M8 16h2M14 16h2"/>')]];
   document.getElementById('nav').innerHTML = tabs.map(([k, t, c, i]) => `<button class="${k===tab?'on':''}" onclick="tab='${k}';go()">${i}<span>${t}</span>${c !== '' ? `<em class="${k === 'review' && c ? 'hot' : ''}">${c}</em>` : ''}</button>`).join('');
@@ -1995,15 +2325,19 @@ function overview(){
   <div class=card><span class=mut>2. Invoices and receipt photos</span><b class=big>${S.uploads.length} file${S.uploads.length===1?'':'s'} for ${qname(S.label)}</b>
     <p class=mut>PDF invoices that never arrive by email, and photos of receipts (HEIC, JPG, PNG).${S.other_quarters ? ` ${S.other_quarters} more files in the folder belong to other quarters.` : ''}</p>
     <input type=file id=up_r multiple accept=".pdf,.png,.jpg,.jpeg,.heic,.heif"> <button class=sec onclick="upload('receipts',document.getElementById('up_r'))">Add and build</button>${flist(S.uploads)}</div>
-  <div class=card><span class=mut>3. Bank statements</span><b class=big>${S.statements.length} CSV export${S.statements.length===1?'':'s'}</b>
+  <div class=card><span class=mut>3. Sales invoices</span><b class=big>${S.rows.filter(isSale).length} invoice${S.rows.filter(isSale).length===1?'':'s'} issued</b>
+    <p class=mut>The invoices you issued: a CSV list from your invoicing tool (invoice number, date, customer, country, VAT number, net, VAT), and / or the PDFs.</p>
+    <input type=file id=up_v multiple accept=".csv,.pdf,.png,.jpg,.jpeg"> <button class=sec onclick="upload('sales',document.getElementById('up_v'))">Add and build</button>${flist(S.sales_files)}</div>
+  <div class=card><span class=mut>4. Bank statements</span><b class=big>${S.statements.length} CSV export${S.statements.length===1?'':'s'}</b>
     <p class=mut>${S.statements.length ? `${cl.filter(paid).length} of ${cl.length} claimed documents have a payment. ${S.unpaid.length ? `<a href="#review">${S.unpaid.length} payment(s) have no document</a>.` : 'No payment is left without a document.'}` : 'Export CSV (not PDF) from each bank and card for the quarter.'}</p>
     <input type=file id=up_s multiple accept=".csv"> <button class=sec onclick="upload('statements',document.getElementById('up_s'))">Add and build</button>${flist(S.statements)}</div>
-  <div class=card><span class=mut>4. Build</span><b class=big>${S.built ? `${S.rows.length} documents, ${S.rows.filter(isOpen).length} open` : 'Not built yet'}</b>
+  <div class=card><span class=mut>5. Build</span><b class=big>${S.built ? `${S.rows.length} documents, ${S.rows.filter(isOpen).length} open` : 'Not built yet'}</b>
     <p class=mut>Reads new documents with the AI${S.has_key?'':' (not configured: only rules, no reading)'}, applies the rules, matches payments, writes the PDFs.</p><button onclick="run('final')">Build ${qname(S.label)}</button></div>
   </div>
   <h2>Result</h2><div class=grid>
   <div class=card><span class=mut>Domestic input VAT (Box 31 / 37)</span><b class=big>${money(f['31'])} / ${money(f['37'])}</b><span class=mut>${n('domestic_input')} documents + ${n('oss_risk')} OSS risk items</span></div>
   <div class=card><span class=mut>Reverse charge (Box 5 / 8)</span><b class=big>${money(f['5'])} / ${money(f['8'])}</b><span class=mut>${n('reverse_charge_eu')} EU, ${n('reverse_charge_non_eu')} non-EU</span></div>
+  <div class=card><span class=mut>Sales / output VAT (Box 25)</span><b class=big>${money(f['1'] + f['2'] + f['22'])} / ${money(f['25'])}</b><span class=mut>${S.rows.filter(isSale).length} invoices issued${f['1'] || f['2'] ? `, ${money(f['1'] + f['2'])} without Maltese VAT (Box 1 / 2)` : ''}</span></div>
   <div class=card><span class=mut>${f['43']>0?'Tax payable (Box 45)':'Excess credit (Box 42)'}</span><b class=big>${money(f['43']>0?f['45']:f['42'])}</b>
     <span class="${fails.length?'bad':'ok'}">${fails.length ? fails.length + ' check(s) failed' : 'All checks pass'}</span></div>
   <div class=card><span class=mut>Compared with the filed return</span><b class="big ${S.filed?(S.diff.length?'bad':'ok'):''}">${S.filed ? (S.diff.length ? S.diff.length + ' box(es) differ' : 'Identical') : 'No filed figures'}</b>
@@ -2018,12 +2352,12 @@ function review(){
     answered: ['Already answered', r => !r.needs_review && S.answers[r.doc_id]]};
   const base = S.rows.filter(groups[v.grp][1]), list = sortRows(base.filter(r => (!v.flag || r.flags.includes(v.flag)) && hit(words(r, ansOf(r.doc_id).note), v.q) && colHit(r, v)), v, rowKey(v.sort));
   shown = list.map(r => r.doc_id);
-  const opts = cur => `<option value="">Leave open</option><option value="accept" ${cur==='accept'?'selected':''}>Checked: keep as it is</option>${CH.map(c=>`<option value="${c}" ${cur===c?'selected':''}>Set: ${nice(c)}</option>`).join('')}`;
+  const opts = (cur, sale) => `<option value="">Leave open</option><option value="accept" ${cur==='accept'?'selected':''}>Checked: keep as it is</option>${(sale ? CHS : CH).map(c=>`<option value="${c}" ${cur===c?'selected':''}>Set: ${nice(c)}</option>`).join('')}`;
   const rowH = (r, sub) => { const a = ansOf(r.doc_id), on = sel.has(r.doc_id); return `<tr data-id="${esc(r.doc_id)}" class="${on ? 'sel' : ''} ${sub ? 'sub' : ''}"><td><input type=checkbox class=cb ${on ? 'checked' : ''}><td class=d>${esc(r.invoice_date)}
     <td><b>${esc(r.supplier)}</b><div class="mut small">${esc(r.invoice_no)} · ${esc(nice(r.doc_type))}</div>
     <td class=n>${esc(r.currency)} ${money(r.gross)}${r.currency !== 'EUR' && r.gross_eur ? `<div class="mut small">EUR ${money(r.gross_eur)}</div>` : ''}<td class=n>${money(vatOf(r))}
     <td>${esc(nice(r.treatment))}<div class="mut small">${esc(r.reason)}</div><td>${r.flags.map(t => chip('rev', t, v.flag, 'q')).join('')}<div class="why small">${esc(r.review_reason)}</div>
-    <td>${links(r)}<td><select class=tr>${opts(a.v)}</select><input type=text class=note placeholder="Note (e.g. business purpose)" value="${esc(a.note)}"></tr>`; };
+    <td>${links(r)}<td><select class=tr>${opts(a.v, isSale(r))}</select><input type=text class=note placeholder="Note (e.g. business purpose)" value="${esc(a.note)}"></tr>`; };
   const gs = new Map(); let body = ''; G = {}; vis = [];
   list.forEach(r => { const k = v.by ? r.supplier || '(no name)' : r.doc_id; gs.has(k) || gs.set(k, []); gs.get(k).push(r); });
   for (const [k, rs] of gs){
@@ -2043,31 +2377,33 @@ function review(){
     <span>${counts(base, r => r.flags).map(([t, c]) => chip('rev', t, v.flag, 'q').replace('</span>', ` ${c}</span>`)).join('')}</span>
     ${dirty(v, R0()) ? `<button class=mini onclick="Object.assign(V.rev,R0());go()">Reset view</button>` : ''}</div>
   <div class="tools batch"><label><input type=checkbox onchange="selAll(this.checked)" ${list.length && list.every(r => sel.has(r.doc_id)) ? 'checked' : ''}> Select all ${list.length} shown</label>
-    <b id=nsel>${sel.size} selected</b><select id=b_act>${opts('')}</select><input type=text id=b_note placeholder="Note for all selected (optional)">
+    <b id=nsel>${sel.size} selected</b><select id=b_act>${opts('')}${CHS.map(c => `<option value="${c}">Set (sales): ${nice(c)}</option>`).join('')}</select><input type=text id=b_note placeholder="Note for all selected (optional)">
     <button class=sec onclick="applyBatch()">Apply to selected</button>${sel.size ? ' <button class="sec mini" onclick="sel.clear();draw()">Clear selection</button>' : ''}
     <span style="flex:1"></span><label><input type=checkbox ${v.by ? 'checked' : ''} onchange="V.rev.by=this.checked?'supplier':'';go()"> Group by supplier</label>
     ${v.by ? `<button class="sec mini" onclick="Object.keys(G).forEach(k => openG.add(k));draw()">Open all</button><button class="sec mini" onclick="openG.clear();draw()">Close all</button>` : ''}</div>
-  <div class=scroll><table><tr><th>${th('rev','invoice_date','Date')}${th('rev','supplier','Supplier')}${th('rev','gross_eur','Amount','n')}${th('rev','vat','VAT EUR','n')}${th('rev','treatment','Treated as')}${th('rev','flags','Question')}<th>Files<th>Your answer</tr>
+  <div class=scroll><table><tr><th>${th('rev','invoice_date','Date')}${th('rev','supplier','Supplier / customer')}${th('rev','gross_eur','Amount','n')}${th('rev','vat','VAT EUR','n')}${th('rev','treatment','Treated as')}${th('rev','flags','Question')}<th>Files<th>Your answer</tr>
   <tr class=f><td>${fin('rev','invoice_date','2026-08')}${fin('rev','supplier')}${fin('rev','gross_eur','>100')}${fin('rev','vat')}${fin('rev','treatment')}${fin('rev','flags')}<td><td></tr>${body}</table></div>
   ${list.length ? '' : '<p class=mut>Nothing matches. Use "Reset view" to see everything again.</p>'}`;
-  if (S.unpaid.length){
-    const free = S.rows.filter(r => live(r) && !paid(r) && (r.gross || 0) > 0), pv = V.pay;
-    const pays = sortRows(S.unpaid.filter(t => hit([t.text, t.date, t.account, money(-t.amount)].join(' ').toLowerCase(), v.q)), pv, t => pv.sort === 'amount' ? -t.amount : t[pv.sort]);
-    pshown = pvis = pays.map(t => t.id);
+  pshown = pvis = [];
+  const payT = (items, inc) => { const k = inc ? 'in' : 'out', pv = V.pay, free = S.rows.filter(r => live(r) && !paid(r) && (r.gross || 0) > 0 && isSale(r) === inc);
+    const pays = sortRows(items.filter(t => hit([t.text, t.date, t.account, money(Math.abs(t.amount))].join(' ').toLowerCase(), v.q)), pv, t => pv.sort === 'amount' ? Math.abs(t.amount) : t[pv.sort]);
+    PIDS[k] = pays.map(t => t.id); pshown = pvis = pvis.concat(PIDS[k]);
     const guess = t => free.filter(r => String(r.supplier).toLowerCase().split(/[^a-z]+/).some(w => w.length > 3 && t.text.toLowerCase().includes(w))
-      || (r.gross_eur && Math.abs(-t.amount - r.gross_eur) <= 0.04 * r.gross_eur)).slice(0, 6);
-    h += `<h2>Payments without a document (${S.unpaid.length})</h2><p class=mut>Money that left the account and matches no invoice. Upload the invoice for it, link it to a document that is already here, or mark it as needing none.</p>
-    <datalist id=docs>${free.map(r => `<option value="${esc(docLabel(r))}">`).join('')}</datalist>
-    <div class="tools batch"><label><input type=checkbox onchange="pshown.forEach(i => this.checked ? psel.add(i) : psel.delete(i));draw()" ${pays.length && pays.every(t => psel.has(t.id)) ? 'checked' : ''}> Select all ${pays.length} shown</label>
-      <b>${psel.size} selected</b><button class=sec onclick="psel.forEach(i => P[i] = {ignore: true});psel.clear();draw()">No document needed for selected</button></div>
+      || (r.gross_eur && Math.abs(Math.abs(t.amount) - r.gross_eur) <= 0.04 * r.gross_eur)).slice(0, 6);
+    return `<h2>${inc ? 'Money in without a sales invoice' : 'Payments without a document'} (${items.length})</h2><p class=mut>${inc ? 'Payments received that match no invoice you issued. Add the invoice, link it to one that is already here, or mark it as not a sale (refund, own transfer, private).'
+      : 'Money that left the account and matches no invoice. Upload the invoice for it, link it to a document that is already here, or mark it as needing none.'}</p>
+    <datalist id=docs_${k}>${free.map(r => `<option value="${esc(docLabel(r))}">`).join('')}</datalist>
+    <div class="tools batch"><label><input type=checkbox onchange="PIDS.${k}.forEach(i => this.checked ? psel.add(i) : psel.delete(i));draw()" ${pays.length && pays.every(t => psel.has(t.id)) ? 'checked' : ''}> Select all ${pays.length} shown</label>
+      <b>${PIDS[k].filter(i => psel.has(i)).length} selected</b><button class=sec onclick="PIDS.${k}.filter(i => psel.has(i)).forEach(i => { P[i] = {ignore: true}; psel.delete(i); });draw()">${inc ? 'Not a sale' : 'No document needed'} for selected</button></div>
     <div class=scroll><table><tr><th>${th('pay','date','Date')}${th('pay','amount','Amount','n')}${th('pay','text','Description')}${th('pay','account','Statement')}<th>What is it?</tr>
     ${pays.map(t => { const p = P[t.id] || {}, g = guess(t), d = p.doc && S.rows.find(r => r.doc_id === p.doc);
-      return `<tr data-pid="${esc(t.id)}" class="${psel.has(t.id) ? 'sel' : ''}"><td><input type=checkbox class=pcb ${psel.has(t.id)?'checked':''}><td class=d>${esc(t.date)}<td class=n>${esc(t.currency)} ${money(-t.amount)}<td>${esc(t.text)}<td>${esc(t.account)}
-      <td><select class=pa><option value="">Leave open</option><option value="ignore" ${p.ignore?'selected':''}>No document needed (private, transfer, cash)</option>
+      return `<tr data-pid="${esc(t.id)}" class="${psel.has(t.id) ? 'sel' : ''}"><td><input type=checkbox class=pcb ${psel.has(t.id)?'checked':''}><td class=d>${esc(t.date)}<td class=n>${esc(t.currency)} ${money(Math.abs(t.amount))}<td>${esc(t.text)}<td>${esc(t.account)}
+      <td><select class=pa><option value="">Leave open</option><option value="ignore" ${p.ignore?'selected':''}>${inc ? 'Not a sale (refund, own transfer, private)' : 'No document needed (private, transfer, cash)'}</option>
         ${g.map(r => `<option value="${esc(r.doc_id)}" ${p.doc===r.doc_id?'selected':''}>It is: ${esc(docLabel(r))}</option>`).join('')}
         ${d && !g.includes(d) ? `<option value="${esc(d.doc_id)}" selected>It is: ${esc(docLabel(d))}</option>` : ''}</select>
-        <input type=text class=pl list=docs placeholder="or type to find another document"> <button class="sec mini" data-up="${esc(t.id)}">Upload its invoice</button></tr>`; }).join('')}</table></div>`;
-  }
+        <input type=text class=pl list=docs_${k} placeholder="or type to find another ${inc ? 'invoice' : 'document'}"> <button class="sec mini" data-up="${esc(t.id)}" data-kind="${inc ? 'sales' : 'receipts'}">Upload its invoice</button></tr>`; }).join('')}</table></div>`; };
+  if (S.unpaid.length) h += payT(S.unpaid, false);
+  if (S.unbilled.length) h += payT(S.unbilled, true);
   const n = Object.keys(E).length + Object.keys(P).length;
   return h + `<div id=bar><button onclick="save()">Save and rebuild</button><span id=msg class="${n ? 'why' : 'mut'}">${n ? n + ' unsaved change(s)' : 'No changes'}</span>
     ${n ? `<button class="sec mini" onclick="E={};P={};draw()">Discard</button>` : ''}</div>`;
@@ -2089,7 +2425,7 @@ function documents(){
     <select onchange="V.doc.tag=this.value;V.doc.id='';go()"><option value="">All tags</option>${counts(S.rows, r => r.tags).map(([t, c]) => `<option value="${esc(t)}" ${t===v.tag?'selected':''}>${esc(t)} (${c})</option>`).join('')}</select>
     ${dirty(v, D0()) ? `<button class=mini onclick="Object.assign(V.doc,D0());go()">Reset view</button>` : ''}${v.id ? ' <b class=why>Showing one document.</b>' : ''}
     <span class=mut>${list.length} of ${S.rows.length} · net EUR ${money(sum('net_eur'))} · VAT EUR ${money(sum('vat'))} (duplicates not counted)</span></div>
-  <div class=scroll><table><tr>${th('doc','invoice_date','Date')}${th('doc','supplier','Supplier')}${th('doc','doc_type','Type')}${th('doc','gross_eur','Gross','n')}${th('doc','net_eur','Net EUR','n')}${th('doc','vat','VAT EUR','n')}${th('doc','treatment','Treatment')}${th('doc','tags','Tags')}${th('doc','payment','Payment')}<th>Files</tr>
+  <div class=scroll><table><tr>${th('doc','invoice_date','Date')}${th('doc','supplier','Supplier / customer')}${th('doc','doc_type','Type')}${th('doc','gross_eur','Gross','n')}${th('doc','net_eur','Net EUR','n')}${th('doc','vat','VAT EUR','n')}${th('doc','treatment','Treatment')}${th('doc','tags','Tags')}${th('doc','payment','Payment')}<th>Files</tr>
   <tr class=f>${fin('doc','invoice_date','2026-08')}${fin('doc','supplier')}${fin('doc','doc_type')}${fin('doc','gross_eur','>100')}${fin('doc','net_eur')}${fin('doc','vat')}${fin('doc','treatment')}${fin('doc','tags')}${fin('doc','payment')}<td></tr>
   ${list.map(r => `<tr><td class=d>${esc(r.invoice_date)}<td><b>${esc(r.supplier)}</b><div class="mut small">${esc(r.invoice_no)}</div><td>${esc(nice(r.doc_type))}<td class=n>${esc(r.currency)} ${money(r.gross)}<td class=n>${money(r.net_eur)}
     <td class=n>${money(vatOf(r))}<td>${esc(nice(r.treatment))}${r.needs_review?' <span class=why title="In the review queue">*</span>':''}<div class="mut small">${esc(r.reason)}</div>
@@ -2099,7 +2435,7 @@ function documents(){
 function ret(){
   const f = S.form, filed = S.filed, cell = b => { const d = filed && Math.abs((filed[b] ?? 0) - f[b]) > 0.004;
     return `<span class=box><i>${b}</i> <b>${money(f[b])}</b>${filed ? (d ? ` <span class=bad>filed ${money(filed[b])}</span>` : ' <span class=ok>=</span>') : ''}${NOT.includes(b)?' <span class=mut>·</span>':''}</span>`; };
-  let h = title('VAT return') + `<p class=mut>VAT FORM 003/2011, in EUR. Working paper: check every figure on the MTCA portal form before you submit there yourself. Boxes marked · are not calculated by this tool (sales, goods for re-sale, capital goods, other rates, adjustments, credit brought forward) and stay 0.00.</p>`;
+  let h = title('VAT return') + `<p class=mut>VAT FORM 003/2011, in EUR. Working paper: check every figure on the MTCA portal form before you submit there yourself. Boxes marked · are not calculated by this tool (goods for re-sale, capital goods, purchases at other rates, adjustments) and stay 0.00.</p>` + S.form_notes.map(x => `<p class=why>${esc(x)}</p>`).join('');
   if (!S.built) h += '<p class=why><b>This quarter is not built yet: every box is 0.00. Use Build on the Overview tab.</b></p>';
   if (filed) h += `<p class="${S.diff.length?'bad':'ok'}"><b>${S.diff.length ? 'Differs from the filed return in box ' + S.diff.join(', ') : 'Every box equals the filed return.'}</b></p>`;
   for (const [sec, lines] of FORM) h += `<h2>${sec}</h2><div class=scroll><table class=form>` + lines.map(([l, bs]) => `<tr><td style="width:46%">${esc(l)}<td>${bs.map(cell).join('')}</tr>`).join('') + '</table></div>';
@@ -2122,7 +2458,7 @@ async function upload(kind, input, pid){
   if (pid) { delete P[pid]; alert(NOTE.map(x => (x[0] ? 'OK: ' : 'FAILED: ') + x[1]).join(NL)); }
   await load(q(), true);
 }
-document.getElementById('up_p').onchange = e => upload('receipts', e.target, payFor);
+document.getElementById('up_p').onchange = e => upload(payKind, e.target, payFor);
 async function run(step){
   if (step === 'gmail' && !confirm(`Scan Gmail for ${qname(S.label)}? The current ${S.label} folder is archived and rebuilt from the mailboxes.`)) return;
   const res = await post(`/run?step=${step}&q=${q()}`, ''); if (!res.ok) alert(await res.text()); job();
@@ -2141,7 +2477,7 @@ document.addEventListener('click', e => {
   const t = e.target.closest('[data-tag]'), d = e.target.closest('[data-doc]'), u = e.target.closest('[data-up]');
   if (t) { const v = t.dataset.view === 'doc' ? V.doc : V.rev, k = t.dataset.view === 'doc' ? 'tag' : 'flag'; v[k] = v[k] === t.dataset.tag ? '' : t.dataset.tag; v.id = ''; go(); }
   else if (d) { e.preventDefault(); Object.assign(V.doc, D0(), {id: d.dataset.doc}); tab = 'documents'; go(); }
-  else if (u) { payFor = u.dataset.up; document.getElementById('up_p').click(); }
+  else if (u) { payFor = u.dataset.up; payKind = u.dataset.kind || 'receipts'; document.getElementById('up_p').click(); }
   else if (e.target.closest('a,select,button,option,input:not([type=checkbox])')) return;
   else if (e.target.closest('tr[data-g]')) { const k = e.target.closest('tr[data-g]').dataset.g, ids = G[k] || [];
     if (e.target.classList.contains('gcb')) { const on = !ids.every(i => sel.has(i)); ids.forEach(i => on ? sel.add(i) : sel.delete(i)); }
@@ -2244,7 +2580,7 @@ def save_answers(out: Path, documents: dict, ignored: list, links: dict | None =
     for key, a in documents.items():
         if a is None:
             docs.pop(key, None)
-        elif a.get('treatment') in REVIEW_CHOICES + (None,):
+        elif a.get('treatment') in REVIEW_CHOICES + SALE_TREATMENTS + (None,):
             docs[key] = {k: v for k, v in (('treatment', a.get('treatment')), ('accepted', True), ('note', str(a.get('note') or '')[:300])) if v}
     ans['documents'] = docs
     ans['ignored_payments'] = sorted(set(ans.get('ignored_payments') or []) | {str(x) for x in ignored})
@@ -2263,7 +2599,12 @@ def row_tags(r: dict) -> tuple[list[str], list[str]]:
     where it came from, whether a payment was found. flags: one short word per open question (from review_reason)."""
     pay, files = r.get('payment') or '', str(r.get('source_file') or '').lower()
     source = {'bolt_csv': 'Bolt report', 'manual': 'receipt photo' if files.endswith(('.jpg', '.jpeg', '.png')) else 'added by hand'}.get(r.get('source'), 'email')
-    tags = [BOX_TAG.get(r['treatment'], 'not in the return'), str(r.get('category') or '').replace('_', ' '), source,
+    box = BOX_TAG.get(r['treatment'], 'not in the return')
+    if is_sale(r):
+        t = r['treatment']
+        box = 'Box ' + (SALE_BOX[t] if t in SALE_BOX else '/'.join(SALE_RATE_BOX.get(r.get('rate_pct'), ('?',)))) if t in SALE_BOX or t == 'sale_domestic' else 'not in the return'
+        source = 'sales list' if r.get('source') == 'sales_csv' else 'sales invoice file'
+    tags = [box, 'sale' if is_sale(r) else '', str(r.get('category') or '').replace('_', ' '), source,
             'paid' if re.match(r'\d{4}', pay) else 'no payment' if pay.startswith('no payment') else '']
     flags = []
     for part in filter(None, str(r.get('review_reason') or '').split('; ')) if r.get('needs_review') else ():
@@ -2330,12 +2671,33 @@ def upload_status(out: Path, label: str, expenses: Path, data: dict, built_at: f
     return files, other, statements
 
 
+def sales_status(out: Path, data: dict, built_at: float) -> list[dict]:
+    """What became of every file under output/sales/ (lists and invoice files), for the Overview tab."""
+    folder, by_id, files = out / 'sales', {r['doc_id']: r for r in data['rows']}, []
+    for path in sorted(folder.rglob('*')) if folder.is_dir() else []:
+        if not path.is_file() or path.name.startswith('.') or path.suffix.lower() not in MANUAL_EXT | {'.csv'}:
+            continue
+        name = str(path.relative_to(folder))
+        if path.stat().st_mtime > built_at:
+            files.append({'file': name, 'state': 'new', 'status': 'not processed yet: press Build'})
+        elif path.suffix.lower() == '.csv':
+            mine = [r for r in data['rows'] if r['doc_id'].startswith(f'sale:{name}#')]
+            files.append({'file': name, 'state': 'review' if any(r['needs_review'] for r in mine) else 'ok',
+                          'status': f'{len(mine)} invoice(s) in this quarter' + (f', {sum(r["needs_review"] for r in mine)} with a question' if any(r['needs_review'] for r in mine) else '')})
+        else:
+            r = by_id.get(f'sale:{name}') or next((x for x in data['rows'] if x.get('direction') == 'sale' and f'sales/{slug(path.stem, 80)}' in str(x.get('source_file'))), None)
+            files.append({'file': name, 'doc_id': r['doc_id'], 'state': 'review' if r['needs_review'] else 'ok',
+                          'status': f'{r["supplier"]} · {r["invoice_date"]} · {r["currency"]} {fmt(r["gross"])} · {r["treatment"].replace("_", " ")}'} if r else
+                         {'file': name, 'state': 'ok', 'status': 'another quarter, or not an issued invoice'})
+    return files
+
+
 def todo_list(s: dict, period) -> list[dict]:
     """What is still needed for the quarter, derived from the state: {done, text, tab to open | run a build}."""
     rows, lo, hi = s['rows'], period[0].isoformat(), period[1].isoformat()
-    waiting = [u for u in s['uploads'] + s['statements'] if u['state'] == 'new']
+    waiting = [u for u in s['uploads'] + s['statements'] + s['sales_files'] if u['state'] == 'new']
     bad = [u for u in s['uploads'] + s['statements'] if u['state'] == 'bad']
-    open_ = sum(r['needs_review'] and r['treatment'] not in ('duplicate', 'pre_registration', 'not_a_purchase') for r in rows)
+    open_ = sum(r['needs_review'] and r['treatment'] not in ('duplicate', 'pre_registration', 'not_a_purchase', 'not_a_sale') for r in rows)
     todo = []
     if not s['built']:
         todo.append({'done': False, 'run': True, 'text': 'Build the quarter (scan Gmail first if the mail was never downloaded for it)'})
@@ -2357,6 +2719,12 @@ def todo_list(s: dict, period) -> list[dict]:
         if s['statements']:
             n = len(s['unpaid'])
             todo.append({'done': not n, 'tab': 'review', 'text': f'{n} payment(s) have no document: upload the invoice, link it, or mark it as needing none' if n else 'Every outgoing payment has a document or an answer'})
+            n = len(s['unbilled'])
+            if n or any(is_sale(r) for r in rows):
+                todo.append({'done': not n, 'tab': 'review', 'text': f'{n} incoming payment(s) have no sales invoice: add the invoice, link it, or mark it as not a sale' if n else 'Every incoming payment has a sales invoice or an answer'})
+        gaps = sales_gaps(rows)
+        if gaps:
+            todo.append({'done': False, 'tab': 'documents', 'text': 'Sales invoice numbers missing from the series: ' + ', '.join(gaps)})
         fails = [c[0] for c in s['checks'] if not c[1]]
         todo.append({'done': not fails, 'tab': 'return', 'text': 'Check failed: ' + '; '.join(fails) if fails else 'All checks on the figures pass'})
         if s['filed']:
@@ -2378,13 +2746,14 @@ def portal_state(out: Path, label: str, expenses: Path) -> dict:
     apath, fpath, period = out / 'review_answers.yml', out / 'filed.json', quarter_range(label)
     answers = ((yaml.safe_load(apath.read_text()) or {}).get('documents') or {}) if apath.exists() else {}
     filed = (json.loads(fpath.read_text()).get(label) if fpath.exists() else None) or None
-    form = return_form(data['rows'])
+    brought, bf_note = brought_forward(out, label)
+    form = return_form(data['rows'], brought)
     today, recent = date.today(), set()
     for i in range(5):  # this quarter and the four before it can always be picked
         m = today.year * 12 + today.month - 1 - 3 * i
         recent.add(f'{m // 12}-Q{m % 12 // 3 + 1}')
     quarters = sorted({d.name for d in out.iterdir() if d.is_dir() and re.fullmatch(r'\d{4}-Q[1-4]', d.name)} | recent | {label}, reverse=True)
-    names = (f'{label}_VAT_worksheet.md', f'{label}_claimable.pdf', f'{label}_noVAT.pdf', 'summary.csv', 'summary_by_vendor.csv')
+    names = (f'{label}_VAT_worksheet.md', f'{label}_claimable.pdf', f'{label}_noVAT.pdf', f'{label}_sales.pdf', f'{label}_recapitulative_statement.csv', 'summary.csv', 'summary_by_vendor.csv')
     uploads, other, statements = upload_status(out, label, expenses, data, built_at)
     try:
         activity = json.loads((out / 'activity.json').read_text())[::-1][:15]
@@ -2392,6 +2761,7 @@ def portal_state(out: Path, label: str, expenses: Path) -> dict:
         activity = []
     s = {'label': label, 'period': [period[0].isoformat(), period[1].isoformat()], 'quarters': quarters, 'built': built,
          'built_at': datetime.fromtimestamp(built_at).strftime('%Y-%m-%d %H:%M') if built else '', 'rows': data['rows'], 'unpaid': data['unpaid'],
+         'unbilled': data.get('unbilled') or [], 'sales_files': sales_status(out, data, built_at), 'form_notes': [bf_note] if bf_note else [],
          'answers': answers, 'form': form, 'filed': filed, 'diff': [b for b in form if filed and abs((filed.get(b) or 0) - form[b]) > 0.004],
          'checks': table_checks(data['rows'], label) if built else [], 'has_key': ai_ready(),
          'uploads': uploads, 'other_quarters': other, 'statements': statements, 'activity': activity,
@@ -2409,7 +2779,7 @@ def serve_portal(out: Path, label: str, expenses: Path, port: int) -> None:
     from urllib.parse import parse_qs
     token = secrets.token_urlsafe(16)
     js = lambda x: json.dumps(x).replace('</', '<\\/')
-    page = (PORTAL_PAGE.replace('__TOKEN__', token).replace('__CHOICES__', js(REVIEW_CHOICES)).replace('__FORM__', js(FORM)).replace('__NOT__', js(FORM_NOT_HANDLED))).encode()
+    page = (PORTAL_PAGE.replace('__TOKEN__', token).replace('__CHOICES__', js(REVIEW_CHOICES)).replace('__SCHOICES__', js(SALE_TREATMENTS)).replace('__FORM__', js(FORM)).replace('__NOT__', js(FORM_NOT_HANDLED))).encode()
     types = {'.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.txt': 'text/plain; charset=utf-8',
              '.csv': 'text/csv; charset=utf-8', '.md': 'text/plain; charset=utf-8'}
 
@@ -2486,7 +2856,8 @@ def serve_portal(out: Path, label: str, expenses: Path, port: int) -> None:
                 if path == '/upload':
                     name = Path(qs.get('name', '')).name
                     ext = Path(name).suffix.lower()
-                    folder, allowed = (out / 'statements', {'.csv'}) if qs.get('kind') == 'statements' else (expenses / 'receipts', MANUAL_EXT)
+                    kind = qs.get('kind')
+                    folder, allowed = (out / 'statements', {'.csv'}) if kind == 'statements' else (out / 'sales', MANUAL_EXT | {'.csv'}) if kind == 'sales' else (expenses / 'receipts', MANUAL_EXT)
                     if ext not in allowed or not body:
                         return self.send(400, f'not accepted here: {name}')
                     folder.mkdir(parents=True, exist_ok=True)
@@ -2500,10 +2871,18 @@ def serve_portal(out: Path, label: str, expenses: Path, port: int) -> None:
                             log_activity(out, f'Statement refused (not readable): {name}', q)
                             return self.send(400, f'{name}: not read as a statement, nothing saved. It needs a header row with a date column and an amount (or debit / credit) column.')
                         msg = f'{name}: statement with {len(got)} transactions, {min(t["date"] for t in got)} to {max(t["date"] for t in got)}'
+                    elif kind == 'sales' and ext == '.csv':
+                        got = read_sales_csv(dest)
+                        if not got:
+                            dest.unlink()
+                            log_activity(out, f'Sales list refused (not readable): {name}', q)
+                            return self.send(400, f'{name}: not read as a sales list, nothing saved. It needs a header row with invoice number, date and net or total columns.')
+                        msg = f'{name}: sales list with {len(got)} invoices, {min(r["date"] for r in got)} to {max(r["date"] for r in got)}'
                     else:
-                        msg, pid = f'{name}: saved as {dest.relative_to(expenses)}', unquote(self.headers.get('X-Payment') or '')
+                        base, prefix = (out / 'sales', 'sale') if kind == 'sales' else (expenses, 'manual')
+                        msg, pid = f'{name}: saved as {dest.relative_to(base)}', unquote(self.headers.get('X-Payment') or '')
                         if pid:  # uploaded as the invoice of one payment: link the two, whatever amount is read from it
-                            save_answers(out, {}, [], {pid: f'manual:{dest.relative_to(expenses)}'})
+                            save_answers(out, {}, [], {pid: f'{prefix}:{dest.relative_to(base)}'})
                             msg += f', linked to the payment of {pid.split("|")[0]}'
                     log_activity(out, 'Added ' + msg, q)
                     return self.send(200, msg)
@@ -2548,7 +2927,7 @@ def main():
     ap.add_argument('--max', type=int, help='process at most N emails')
     ap.add_argument('--triage', action='store_true', help='re-run VAT triage (the AI reads the facts, duplicates, noVAT folders, PDFs) on everything already in the ledger; no Gmail')
     ap.add_argument('--expenses', default=str(HERE / 'output' / 'expenses'), help='folder of hand-collected invoices (Amazon, Google, ...) added to the scope; default output/expenses')
-    ap.add_argument('--final', action='store_true', help='no Gmail: take the quarter from the ledger, add the expenses folder, triage, summaries and build the two merged PDFs')
+    ap.add_argument('--final', action='store_true', help='no Gmail: take the quarter from the ledger, add the expenses and sales folders, triage, summaries and build the merged PDFs')
     ap.add_argument('--portal', action='store_true', help='open the local portal on http://127.0.0.1:<port>: scan Gmail, add statements and receipts, build, review, and see the VAT return form next to the filed figures')
     ap.add_argument('--review', action='store_true', help='same as --portal')
     ap.add_argument('--port', type=int, default=8765, help='port of the review page')

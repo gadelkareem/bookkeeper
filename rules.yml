@@ -6,7 +6,7 @@
 
 home_country: MT
 standard_rate: 18          # reverse-charge VAT is computed at this rate on the EUR net
-registration_date: 2026-04-01   # documents dated before the VAT registration are outside every return
+registration_date:            # your VAT registration date (YYYY-MM-DD): set it in output/decisions.yml; earlier documents are outside every return
 min_confidence: 0.7        # a row read with less confidence goes to the review queue
 
 # VAT rates per country (standard first). Used to tell whose VAT a foreign supplier charged: 18% from a

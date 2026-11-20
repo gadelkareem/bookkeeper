@@ -23,3 +23,6 @@ tmp.sh
 # Client id that failed with accessNotConfigured
 .rejected_client
 .env_stamp
+
+# Made-up quarter written by demo.py
+demo_output/
