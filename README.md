@@ -66,3 +66,7 @@ when you configure one.
   capital goods and other rates are not calculated.
 - Bank statements are read from CSV exports; there is no bank API and no PDF statement reader.
 - Built-in handling exists for Bolt Business ride reports; other suppliers go through the general rules.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE).
