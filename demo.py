@@ -31,7 +31,7 @@ SUPPLIERS = [
     ('Streamly Sarl', 'LU', 'LU20000066', 'MT', 18, 'EUR', 'simplified_invoice', 'software', False, True),
     ('Amstel Parts BV', 'NL', 'NL200000077B01', 'NL', 21, 'EUR', 'tax_invoice', 'hardware', False, False),
     ('Sliema Corner Cafe', 'MT', 'MT20000088', 'MT', 18, 'EUR', 'fiscal_receipt', 'food_drink', False, False),
-    ('Bolt', 'MT', 'MT20000099', 'MT', 18, 'EUR', 'tax_invoice', 'transport', False, False),
+    ('Zipcab Malta', 'MT', 'MT20000099', 'MT', 18, 'EUR', 'tax_invoice', 'transport', False, False),
     ('Marsa Print Shop', 'MT', 'MT20000110', 'MT', 18, 'EUR', 'tax_invoice', 'professional_services', False, False),
 ]
 # customer, country, VAT number, VAT rate (None = no VAT charged), currency, goods or services
@@ -72,6 +72,7 @@ def build(out: Path, label: str | None = None, seed: int = 7) -> tuple[Path, str
     (out / 'decisions.yml').write_text(
         f'# Made-up decisions for the demo quarter.\nvat_number: {OWNER_VAT}\nregistration_date: {start.replace(month=1, day=1)}\nsuppliers:\n'
         + ''.join(f"  - {{match: '{name.split()[0].lower()}', business: true}}\n" for name, *rest in SUPPLIERS if rest[-1])
+        + "  - {match: 'zipcab', treatment: personal, reason: 'taxi ride, no business purpose recorded', review: 'taxi ride: business purpose?'}\n"
         + "ignore_payments: ['rent', 'own savings']\n")
 
     ledger, bank, day_of = {}, [], lambda: start + timedelta(days=rnd.randrange(2, days - 2))
@@ -98,7 +99,7 @@ def build(out: Path, label: str | None = None, seed: int = 7) -> tuple[Path, str
     first = next(k for k, r in ledger.items() if r['doc_type'] == 'tax_invoice')  # the order confirmation of one invoice: a duplicate
     ledger['demo900'] = {**ledger[first], 'doc_type': 'order_confirmation', 'files': [], 'subject': 'Order confirmed'}
     ledger['demo901'] = {**ledger[first], 'vendor': 'Unknown Web Shop', 'invoice_number': 'W-55120', 'supplier_country': None, 'supplier_vat': None,
-                         'vat_country': None, 'buyer_vat': None, 'confidence': 0.55, 'files': [], 'total_amount': 64.9, 'net_amount': None, 'vat_amount': None, 'vat_rate': None}
+                         'vat_country': None, 'buyer_vat': None, 'category': 'other', 'confidence': 0.55, 'files': [], 'total_amount': 64.9, 'net_amount': None, 'vat_amount': None, 'vat_rate': None}
     (out / 'ledger.json').write_text(json.dumps(ledger, indent=2))
 
     sales, no = [], 40

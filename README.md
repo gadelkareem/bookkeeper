@@ -22,6 +22,18 @@ in it is tax advice: you decide every tax question and you submit the return you
 - Writes `summary.csv`, a worksheet, and merged PDFs (claimed documents, everything else, sales).
 - Serves a local portal (127.0.0.1 only) to upload files, answer the open questions and see the return form.
 
+## Screenshots
+
+From the made-up quarter of `demo.py`: every company, number and amount is invented.
+
+| Overview | Review |
+|---|---|
+| ![Overview: to do, collect, result](docs/screenshots/overview.png) | ![Review: open questions and payments](docs/screenshots/review.png) |
+
+| Documents | VAT return |
+|---|---|
+| ![Documents: the table with tags](docs/screenshots/documents.png) | ![VAT return: every box of the form](docs/screenshots/return.png) |
+
 ## Setup
 
 ```bash

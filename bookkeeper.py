@@ -2667,7 +2667,7 @@ def upload_status(out: Path, label: str, expenses: Path, data: dict, built_at: f
         else:
             statements.append({'file': path.name, 'state': 'review' if s['unmatched'] else 'ok', 'from': s['from'], 'to': s['to'],
                                'status': f'{s["transactions"]} transactions, {s["from"]} to {s["to"]} · {s["matched"]} matched to a document'
-                                         + (f' · {s["unmatched"]} outgoing without a document (Review tab)' if s['unmatched'] else '')})
+                                         + (f' · {s["unmatched"]} without a document or invoice (Review tab)' if s['unmatched'] else '')})
     return files, other, statements
 
 
