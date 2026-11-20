@@ -1,0 +1,42 @@
+# Classification rules for bookkeeper.py. Data, not code: edit here, not in the script.
+# The owner's own decisions (which suppliers are business costs, what to do with one document) do not belong
+# here: they go in output/decisions.yml, which is read first and is not committed.
+#
+# Nothing in this file is tax advice. Confirm anything with tax impact with the accountant.
+
+home_country: MT
+standard_rate: 18          # reverse-charge VAT is computed at this rate on the EUR net
+registration_date: 2026-04-01   # documents dated before the VAT registration are outside every return
+min_confidence: 0.7        # a row read with less confidence goes to the review queue
+
+# VAT rates per country (standard first). Used to tell whose VAT a foreign supplier charged: 18% from a
+# Luxembourg or Irish supplier is Maltese VAT collected through OSS, 21% from Ireland-based Apple is Dutch VAT.
+vat_rates:
+  MT: [18, 12, 7, 5]
+  NL: [21, 9]
+  IE: [23, 13.5, 9]
+  LU: [17, 14, 8, 3]
+  DE: [19, 7]
+  IT: [22, 10, 5, 4]
+  FR: [20, 10, 5.5, 2.1]
+  ES: [21, 10, 4]
+  GB: [20, 5]
+  EG: [14]
+
+# Supplier rules. `match` is a case-insensitive regular expression on the supplier name; the first match wins
+# (output/decisions.yml suppliers are tried first). Keys:
+#   treatment: fixed treatment for every document of the supplier (personal, blocked, foreign_vat, ...)
+#   reason:    shown in the table
+#   review:    text added to the review queue for every document
+#   business:  true = the owner uses this supplier for the business (needed for a claim when the invoice
+#              does not show the buyer VAT number)
+#   country:   ISO-2 country of the supplier, overriding what was read from the document
+#   mixed_use: true = flag every claimed document as home + office
+suppliers:
+  - match: '\b(bolt|uber|ecabs)\b'
+    treatment: personal
+    reason: taxi ride, no business purpose recorded
+    review: 'taxi ride: business purpose? To claim it, add the invoice number to output/decisions.yml'
+  - match: '\b(wolt|talabat)\b'
+    treatment: blocked
+    reason: food and drink

@@ -1,0 +1,25 @@
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# Secrets -- never commit
+credentials.json
+token.json
+token_*.json
+.env
+
+# Private settings (mailboxes, model, own senders and suppliers) -- copy config.example.yml
+config.yml
+
+# Downloaded invoices, ledger, tax decisions, statements, filed figures -- personal financial data, never commit
+output/
+
+# Local helper
+tmp.sh
+
+# Client id that failed with accessNotConfigured
+.rejected_client
+.env_stamp

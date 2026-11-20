@@ -1,0 +1,40 @@
+# Private settings for bookkeeper.py. Copy this file to config.yml (gitignored) and fill it in.
+# Another location: set BOOKKEEPER_CONFIG to the file's path.
+# Tax rules (rates, registration date, supplier classes) are in rules.yml; your own tax decisions go in
+# output/decisions.yml (see README.md).
+
+# Gmail mailboxes to scan. The first one uses token.json, the others token_<address>.json.
+# BOOKKEEPER_ACCOUNTS=a@example.com,b@example.com overrides this list.
+accounts:
+  - you@example.com
+
+# Model used to read documents. Leave empty to run with the regex pass and the rules only.
+# The API key is read from the ANTHROPIC_API_KEY environment variable, never from this file.
+ai_model: ''
+# USD per million input / output tokens, only used for the cost line in the log.
+ai_price_per_mtok: [0, 0]
+
+# Senders and subjects that match the search but are never bookkeeping documents (regular expressions,
+# case-insensitive). Banks and card services are already filtered.
+noise_senders:
+  # - '\b(marketplace|broker)\b'
+noise_subjects:
+  # - 'weekly digest'
+
+# Extra Gmail search terms to exclude, in Gmail syntax.
+search_exclude:
+  # - 'from:reviews.example.com'
+
+# Replace the built-in search words (English, Dutch, German) with your own list.
+# keywords: [invoice, receipt, facture]
+
+# Merge the folder names of a supplier that emails under several names (lower-case slug: folder).
+vendor_aliases:
+  # noreply-billing-acme-online: Acme
+
+# Invoice links that return the PDF without a login. Hosts are trusted whole; prefixes are for hosts that
+# also serve login-only pages (only URLs starting with the prefix are fetched).
+hosted_pdf_hosts:
+  # - invoices.example.com
+hosted_pdf_prefixes:
+  # - https://www.example.com/ebilling/ShowBill
