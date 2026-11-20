@@ -483,7 +483,7 @@ DOC_TYPES = ('tax_invoice', 'simplified_invoice', 'fiscal_receipt', 'order_confi
 TAX_DOCS = ('tax_invoice', 'simplified_invoice')  # the only documents that can support input VAT
 
 
-# List prices per million tokens, only for the cost estimate in the log
+# List prices per million tokens (config: ai_price_per_mtok), only for the cost estimate in the log
 PRICE_IN, PRICE_OUT = (list(CONFIG.get('ai_price_per_mtok') or []) + [0.0, 0.0])[:2]  # USD per million input / output tokens, for the cost line in the log
 USAGE = {'calls': 0, 'binary': 0, 'in': 0, 'out': 0}
 
